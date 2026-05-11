@@ -1,0 +1,6 @@
+debug-buddy
+*.[oa]
+*.out
+*~
+*.log
+

@@ -1,133 +1,232 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
-	"go/types"
-	"log"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
-	"sort"
-
-	"golang.org/x/tools/go/packages"
+	"slices"
 )
 
 var (
-	buf         *bytes.Buffer = bytes.NewBuffer(nil)
-	funcName    string
+	funcNames   FuncNames
 	packageName string
 	verbose     bool
 )
 
-func getSymbols(scope *types.Scope, pkgPath string) {
-	for _, name := range scope.Names() {
-		obj := scope.Lookup(name)
-		// FILTER: Skip imported packages
-		if obj.Pkg() != nil && obj.Pkg().Path() != pkgPath {
-			continue
-		}
-		switch v := obj.(type) {
-		case *types.Var:
-			kind := v.Kind().String()
-			if kind == "PackageVar" {
-				buf.WriteString(fmt.Sprintf("watch -w %s\n", name))
-			}
-		case *types.Func:
-			if funcName == "" || name == funcName {
-				buf.WriteString(fmt.Sprintf("break %s.%s\n", v.Pkg().Name(), name))
-				parseFunc(v.Scope())
-			}
-		}
-	}
-	// Unfortunately, this will get duplicate vars.  It's necessary to do this,
-	// but only in the scope of a function.
-	//	for child := range scope.Children() {
-	//		getSymbols(child, pkgPath)
-	//	}
+type FuncNames []string
+
+func (f *FuncNames) String() string {
+	return ""
 }
 
-func parseFunc(scope *types.Scope) {
-	for _, name := range scope.Names() {
-		obj := scope.Lookup(name)
-		if v, ok := obj.(*types.Var); ok {
-			if v.Kind().String() == "LocalVar" {
-				buf.WriteString(fmt.Sprintf("display -a %s\n", v.Name()))
+func (f *FuncNames) Set(name string) error {
+	*f = append(*f, name)
+	return nil
+}
+
+type Node struct {
+	Val  string
+	Type string
+	Cmd  string
+}
+
+type Scope struct {
+	PkgName string
+	Func    *ast.FuncDecl
+	Nodes   []*Node
+}
+
+func filterDuplicates(in <-chan []*Node) <-chan *Node {
+	out := make(chan *Node)
+	go func() {
+		defer close(out)
+		seen := make(map[string]string)
+		for stmt := range in {
+			for _, s := range stmt {
+				if _type, found := seen[s.Val]; found && _type == s.Type {
+					continue
+				}
+				seen[s.Val] = s.Type
+				out <- s
 			}
 		}
+	}()
+	return out
+}
+
+func filterTypes(in <-chan *Node) <-chan *Node {
+	out := make(chan *Node)
+	go func() {
+		defer close(out)
+		for stmt := range in {
+			if stmt.Type != "*ast.BasicLit" &&
+				stmt.Type != "TODO" &&
+				stmt.Val != "" &&
+				stmt.Val != "TODO" {
+				out <- stmt
+			}
+		}
+	}()
+	return out
+}
+
+func getExpression(e ast.Expr) any {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		//		return v.Value
+	case *ast.BinaryExpr:
+		return getExpression(v.X)
+	case *ast.CallExpr:
+		//		return getExpression(v.Fun)
+	case *ast.Ident:
+		return v.Name
+	case *ast.IndexExpr:
+		return fmt.Sprintf("%%v %s[%s]\n", getExpression(v.X), v.Index)
+	case *ast.FuncLit:
+		return v.Body
 	}
-	for child := range scope.Children() {
-		parseFunc(child)
+	return ""
+}
+
+func getFuncParams(scope *Scope) <-chan *Scope {
+	out := make(chan *Scope)
+	go func() {
+		defer close(out)
+		for _, field := range scope.Func.Type.Params.List {
+			for _, fieldName := range field.Names {
+				scope.Nodes = append(
+					scope.Nodes,
+					&Node{
+						Val:  fieldName.Name,
+						Type: fmt.Sprintf("%T", fieldName),
+					},
+				)
+			}
+		}
+		out <- scope
+	}()
+	return out
+}
+
+func getNodes(in <-chan *Scope) <-chan []*Node {
+	out := make(chan []*Node)
+	go func() {
+		defer close(out)
+		for scope := range in {
+			out <- getStatements(scope.Func.Body.List, scope.Nodes)
+		}
+	}()
+	return out
+}
+
+func getStatements(list []ast.Stmt, nodes []*Node) []*Node {
+	for _, stmt := range list {
+		switch v := stmt.(type) {
+		case *ast.AssignStmt:
+			for _, e := range v.Lhs {
+				nodes = append(nodes, &Node{
+					Val:  getExpression(e).(string),
+					Type: fmt.Sprintf("%T", e),
+				})
+			}
+			for _, e := range v.Rhs {
+				nodes = append(nodes, &Node{
+					Val:  getExpression(e).(string),
+					Type: fmt.Sprintf("%T", e),
+				})
+			}
+		case *ast.CaseClause:
+			nodes = getStatements(v.Body, nodes)
+		case *ast.DeclStmt:
+			generalDeclarationNodes := v.Decl.(*ast.GenDecl)
+			for _, spec := range generalDeclarationNodes.Specs {
+				val := spec.(*ast.ValueSpec)
+				for _, name := range val.Names {
+					nodes = append(nodes, &Node{
+						Val:  name.Name,
+						Type: "TODO",
+					})
+				}
+			}
+		case *ast.DeferStmt:
+		case *ast.ForStmt:
+			nodes = getStatements(v.Body.List, nodes)
+		case *ast.GoStmt:
+			nodes = getStatements(getExpression(v.Call).(*ast.BlockStmt).List, nodes)
+		case *ast.IfStmt:
+			nodes = getStatements(v.Body.List, nodes)
+			nodes = append(nodes, &Node{
+				Val:  getExpression(v.Cond).(string),
+				Type: fmt.Sprintf("%T", v.Cond),
+			})
+		case *ast.RangeStmt:
+			nodes = getStatements(v.Body.List, nodes)
+		case *ast.ReturnStmt:
+		case *ast.TypeSwitchStmt:
+			nodes = getStatements(v.Body.List, nodes)
+		}
 	}
+	return nodes
+}
+
+func outputCmd(in <-chan *Node) <-chan *Node {
+	out := make(chan *Node)
+	go func() {
+		defer close(out)
+		for stmt := range in {
+			stmt.Cmd = fmt.Sprintf("display -a %s\n", stmt.Val)
+			out <- stmt
+		}
+	}()
+	return out
+}
+
+func pipeline(scope *Scope) <-chan *Node {
+	return outputCmd(
+		filterTypes(
+			filterDuplicates(
+				getNodes(
+					getFuncParams(scope),
+				),
+			),
+		),
+	)
 }
 
 func main() {
-	flag.StringVar(&funcName, "func", "", "The name of the function to get the symbols.")
-	flag.StringVar(&packageName, "package", "", "The name of the package to get the symbols.")
+	flag.Var(&funcNames, "func", "The name of the function to get the symbols.")
+	flag.StringVar(&packageName, "package", "main", "The name of the package to get the symbols.")
 	flag.BoolVar(&verbose, "verbose", false, "Print debug information.")
 	flag.Parse()
 
-	pkgs, err := packages.Load(&packages.Config{
-		Mode: packages.NeedName |
-			packages.NeedFiles |
-			packages.NeedCompiledGoFiles |
-			packages.NeedTypes |
-			packages.NeedTypesInfo,
-	}, packageName)
+	fs := token.NewFileSet()
+	cwd, _ := os.Getwd()
+	pkgs, _ := parser.ParseDir(fs, cwd, nil, parser.SkipObjectResolution)
 
-	if err != nil {
-		log.Fatal(err)
-	}
-	if len(pkgs) == 0 {
-		log.Fatal("No packages found")
-	}
-
-	pkg := pkgs[0]
-	scope := pkg.Types.Scope()
-
-	if verbose {
-		fmt.Printf("Package: %s\n", pkg.Name)
-		fmt.Printf("Go Files: %d\n", len(pkg.GoFiles))
-		fmt.Printf("Compiled Files: %d\n", len(pkg.CompiledGoFiles))
-		fmt.Printf("Errors: %d\n", len(pkg.Errors))
-
-		for _, err := range pkg.Errors {
-			fmt.Println("Load Error:", err)
+	var scopes []*Scope
+	for pkgName, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				switch v := decl.(type) {
+				case *ast.FuncDecl:
+					if slices.Contains(funcNames, v.Name.Name) {
+						scopes = append(scopes, &Scope{
+							PkgName: pkgName,
+							Func:    v,
+						})
+					}
+				}
+			}
 		}
-
-		if pkg.Types == nil {
-			log.Fatal("pkg.Types is nil - types not loaded properly")
-		}
-
-		names := scope.Names()
-		sort.Strings(names)
-
-		fmt.Printf("\n=== All Names in Package Scope (%d total) ===\n", len(names))
-		for _, name := range names {
-			obj := scope.Lookup(name)
-			fmt.Printf("%-30s : %T\n", name, obj)
-		}
-		//	fmt.Println("\n=== Target Variables NOT Found ===")
-		//	fmt.Println("Possible reasons:")
-		//	fmt.Println("1. Build constraints exclude the files containing these vars")
-		//	fmt.Println("2. Variables are defined in a nested scope (inside a func)")
-		//	fmt.Println("3. go:embed directive failed (missing .tpl files)")
-		//	fmt.Println("4. Package wasn't built with full type info")
-		fmt.Printf("\n=== Loaded Go Files ===\n")
-		for i, f := range pkg.GoFiles {
-			fmt.Printf("%d: %s\n", i+1, f)
-		}
-
-		buf.WriteString("\n=== Delve Debug Commands ===\n")
 	}
 
-	// Sanity check
-	//	fmt.Printf("Loaded Package: %s (Path: %s)\n\n", pkg.Name, pkg.PkgPath)
-
-	if pkg.Types == nil {
-		log.Fatal("Types not loaded")
+	for _, scope := range scopes {
+		fmt.Printf("break %s.%s\n", scope.PkgName, scope.Func.Name.Name)
+		for stmt := range pipeline(scope) {
+			fmt.Print(stmt.Cmd)
+		}
 	}
-
-	//	buf.WriteString("continue main.main\n")
-	getSymbols(scope, pkg.PkgPath)
-	buf.WriteTo(os.Stdout)
 }
